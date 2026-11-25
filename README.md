@@ -34,6 +34,10 @@ that turns PC priority off and sets the RAW-conversion gate.
 To build the SD-boot patch card (`FMPATCH.BIN`), use **FujiMod / x70view**'s
 `usb-tether-xpp` mod and SD boot v2 loader.
 
+If you want to unlock the same ability on another Fuji body or firmware,
+see [PORTING.md](PORTING.md) for a step-by-step write-up of how this X-T20
+2.11 port was found, tested, and what broke on the host side.
+
 ## Safety (read before plugging in)
 
 The USB mode used here (`USB RAW CONV./BACKUP RESTORE`) is a service-grade PTP
