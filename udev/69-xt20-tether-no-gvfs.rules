@@ -1,0 +1,34 @@
+# Keep the desktop's gvfs camera monitor away from a tethered X-T20.
+#
+# gvfs-gphoto2-volume-monitor opens a PTP session on every device that carries
+# the udev property ID_GPHOTO2, fails, and keeps the session, which locks the
+# camera out for gphoto2 / INDI / Ekos. It decides only on that property
+# (gvfs monitor/gphoto2/ggphoto2volumemonitor.c: on_uevent and coldplug check
+# g_udev_device_has_property(device, "ID_GPHOTO2")). GVFS_IGNORE and
+# UDISKS_IGNORE are udisks block-device hints and have no effect here; for the
+# same reason indi-gphoto's own 85-disable-dslr-automout.rules (UDISKS_AUTO=0)
+# does not stop this lock.
+#
+# This rule removes ID_GPHOTO2 from the X-T20 PTP personality (04cb:02d4) after
+# libgphoto2's own rules (60-libgphoto2*.rules) have set it. systemd's
+# 70-uaccess.rules grants desktop users access to cameras because of that same
+# property, so the rule adds the uaccess tag itself to keep gphoto2 and
+# indi_gphoto_ccd working without root. Other cameras are not affected.
+#
+# Side effect: the X-T20 no longer auto-mounts in the file manager / photo
+# importers in any USB mode that uses this ID. Remove the file to undo.
+#
+# Install:   sudo install -m 0644 69-xt20-tether-no-gvfs.rules /etc/udev/rules.d/
+#            sudo udevadm control --reload
+#            then unplug and replug the camera
+# Uninstall: sudo rm /etc/udev/rules.d/69-xt20-tether-no-gvfs.rules
+#            sudo udevadm control --reload
+#            then unplug and replug the camera
+
+ACTION=="remove", GOTO="xt20_tether_no_gvfs_end"
+SUBSYSTEM!="usb", GOTO="xt20_tether_no_gvfs_end"
+ENV{DEVTYPE}!="usb_device", GOTO="xt20_tether_no_gvfs_end"
+
+ATTR{idVendor}=="04cb", ATTR{idProduct}=="02d4", ENV{ID_GPHOTO2}="", TAG+="uaccess"
+
+LABEL="xt20_tether_no_gvfs_end"

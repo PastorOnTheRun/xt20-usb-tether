@@ -1,0 +1,356 @@
+diff --git a/indi-gphoto/gphoto_ccd.cpp b/indi-gphoto/gphoto_ccd.cpp
+index 6c29190..f03fed9 100644
+--- indi-gphoto/gphoto_ccd.cpp
++++ indi-gphoto/gphoto_ccd.cpp
+@@ -38,6 +38,35 @@
+ #include <sys/mman.h>
+ #include <fcntl.h>
+ #include <sys/stat.h>
++#include <chrono>
++#include <thread>
++
++// Fuji bodies answer PTP 0x2019 Device Busy for a short while after live view stops.
++// Remember when the last preview stop happened so the next still exposure can settle
++// first. File-scope because the header is left untouched; one camera per driver process
++// is the normal case. Override the delay with INDI_GPHOTO_FUJI_SETTLE_MS (0 disables).
++namespace
++{
++std::chrono::steady_clock::time_point s_FujiPreviewStoppedAt {};
++bool s_FujiPreviewStopPending = false;
++
++int fujiSettleMs()
++{
++    const char *env = getenv("INDI_GPHOTO_FUJI_SETTLE_MS");
++    if (env && *env)
++    {
++        int v = atoi(env);
++        return v < 0 ? 0 : (v > 10000 ? 10000 : v);
++    }
++    return 750;
++}
++
++bool isFuji(gphoto_driver *drv)
++{
++    const char *m = drv ? gphoto_get_manufacturer(drv) : nullptr;
++    return m && strcasestr(m, "Fuji");
++}
++}
+ 
+ #define FOCUS_TAB    "Focus"
+ #define MAX_DEVICES  5 /* Max device cameraCount */
+@@ -416,6 +445,14 @@ bool GPhotoCCD::updateProperties()
+         {
+             defineProperty(CaptureTargetSP);
+         }
++        else if (isFuji(gphotodrv))
++        {
++            // Fuji USB tether has no capturetarget widget; still frames live in RAM (/store_10000001).
++            // Leaving a frame there blocks subsequent live-view InitiateOpenCapture (0x101c) with 0x2019 Busy.
++            SDCardImageSP.reset();
++            SDCardImageSP[SD_CARD_DELETE_IMAGE].setState(ISS_ON);
++            gphoto_handle_sdcard_image(gphotodrv, DELETE_IMAGE);
++        }
+ 
+         defineProperty(SDCardImageSP);
+ 
+@@ -1052,10 +1089,38 @@ bool GPhotoCCD::StartExposure(float duration)
+     else
+         LOGF_INFO("Starting %g seconds exposure.", duration);
+ 
++    // Fuji: give the body a moment after STREAM_OFF before the first still exposure,
++    // and retry once if it still answers busy right after live view.
++    bool fujiAfterPreview = false;
++    if (isSimulation() == false && s_FujiPreviewStopPending && isFuji(gphotodrv))
++    {
++        fujiAfterPreview = true;
++        s_FujiPreviewStopPending = false;
++        auto settle = std::chrono::milliseconds(fujiSettleMs());
++        auto elapsed = std::chrono::steady_clock::now() - s_FujiPreviewStoppedAt;
++        if (elapsed < settle)
++        {
++            auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(settle - elapsed);
++            LOGF_DEBUG("Fuji: waiting %lld ms after live view stop before exposing.",
++                       static_cast<long long>(remaining.count()));
++            std::this_thread::sleep_for(remaining);
++        }
++    }
++
+     if (isSimulation() == false && gphoto_start_exposure(gphotodrv, exp_us, MirrorLockNP[0].getValue()) < 0)
+     {
+-        LOG_ERROR("Error starting exposure");
+-        return false;
++        bool started = false;
++        if (fujiAfterPreview)
++        {
++            LOG_WARN("Fuji: exposure start failed right after live view (camera busy?); retrying once in 1 s.");
++            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
++            started = gphoto_start_exposure(gphotodrv, exp_us, MirrorLockNP[0].getValue()) >= 0;
++        }
++        if (!started)
++        {
++            LOG_ERROR("Error starting exposure");
++            return false;
++        }
+     }
+ 
+     ExposureRequest = duration;
+@@ -1917,12 +1982,23 @@ void GPhotoCCD::UpdateFocusMotionCallback()
+ ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+ bool GPhotoCCD::StartStreaming()
+ {
++    m_PreStreamSubX = PrimaryCCD.getSubX();
++    m_PreStreamSubY = PrimaryCCD.getSubY();
++    m_PreStreamSubW = PrimaryCCD.getSubW();
++    m_PreStreamSubH = PrimaryCCD.getSubH();
++    m_HasPreStreamFrame = true;
++    liveVideoWidth = -1;
++    liveVideoHeight = -1;
++
+     if (gphoto_start_preview(gphotodrv) == GP_OK)
+     {
+         Streamer->setPixelFormat(INDI_RGB);
+         std::unique_lock<std::mutex> guard(liveStreamMutex);
+         m_RunLiveStream = true;
+         guard.unlock();
++        // Do not assign over a still-joinable thread (std::thread would call terminate()).
++        if (m_LiveViewThread.joinable())
++            m_LiveViewThread.join();
+         m_LiveViewThread = std::thread(&GPhotoCCD::streamLiveView, this);
+         return true;
+     }
+@@ -1939,8 +2015,31 @@ bool GPhotoCCD::StopStreaming()
+     std::unique_lock<std::mutex> guard(liveStreamMutex);
+     m_RunLiveStream = false;
+     guard.unlock();
+-    m_LiveViewThread.join();
+-    return (gphoto_stop_preview(gphotodrv) == GP_OK);
++    // A second STREAM_OFF after a failed stop used to call join() on a non-joinable
++    // thread and abort with std::system_error: Invalid argument.
++    if (m_LiveViewThread.joinable())
++        m_LiveViewThread.join();
++    int rc = gphoto_stop_preview(gphotodrv);
++    if (rc != GP_OK)
++        LOGF_WARN("gphoto_stop_preview: %s (continuing so still capture can proceed)", gp_result_as_string(rc));
++    if (m_HasPreStreamFrame)
++    {
++        // streamLiveView() sets PrimaryCCD.setFrame(0, 0, previewW, previewH) (e.g. 640x480);
++        // restore full/prior still frame so the next exposure is not cropped to live-view size.
++        int rw = m_PreStreamSubW > 0 ? m_PreStreamSubW : PrimaryCCD.getXRes();
++        int rh = m_PreStreamSubH > 0 ? m_PreStreamSubH : PrimaryCCD.getYRes();
++        if (rw > 0 && rh > 0)
++            PrimaryCCD.setFrame(m_PreStreamSubX, m_PreStreamSubY, rw, rh);
++        m_HasPreStreamFrame = false;
++    }
++    liveVideoWidth = -1;
++    liveVideoHeight = -1;
++    if (isFuji(gphotodrv))
++    {
++        s_FujiPreviewStoppedAt = std::chrono::steady_clock::now();
++        s_FujiPreviewStopPending = true;
++    }
++    return true;
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -1961,6 +2060,7 @@ void GPhotoCCD::streamLiveView()
+     }
+ 
+     char errMsg[MAXRBUF] = {0};
++    int previewFailCount = 0;
+     while (true)
+     {
+         std::unique_lock<std::mutex> guard(liveStreamMutex);
+@@ -1971,10 +2071,14 @@ void GPhotoCCD::streamLiveView()
+         rc = gphoto_capture_preview(gphotodrv, previewFile, errMsg);
+         if (rc != GP_OK)
+         {
+-            //LOGF_DEBUG("%s", errMsg);
++            LOGF_DEBUG("%s", errMsg);
++            previewFailCount++;
++            if (previewFailCount == 1 || previewFailCount % 50 == 0)
++                LOGF_ERROR("Live preview failed (%d): %s", previewFailCount, errMsg);
+             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+             continue;
+         }
++        previewFailCount = 0;
+ 
+         if (rc >= GP_OK)
+         {
+diff --git a/indi-gphoto/gphoto_ccd.h b/indi-gphoto/gphoto_ccd.h
+index cb871ba..9bb8106 100644
+--- indi-gphoto/gphoto_ccd.h
++++ indi-gphoto/gphoto_ccd.h
+@@ -169,6 +169,8 @@ class GPhotoCCD : public INDI::CCD, public INDI::FocuserInterface
+ 
+         int liveVideoWidth  {-1};
+         int liveVideoHeight {-1};
++        bool m_HasPreStreamFrame {false};
++        int m_PreStreamSubX {0}, m_PreStreamSubY {0}, m_PreStreamSubW {0}, m_PreStreamSubH {0};
+ 
+         // binning ?
+         bool binning { false };
+diff --git a/indi-gphoto/gphoto_driver.cpp b/indi-gphoto/gphoto_driver.cpp
+index 65355cc..c181ec5 100644
+--- indi-gphoto/gphoto_driver.cpp
++++ indi-gphoto/gphoto_driver.cpp
+@@ -155,6 +155,7 @@ struct _gphoto_driver
+     int upload_settings;
+     CameraImageHandling handle_sdcard_image;
+     bool is_aborted;
++    int capture_rc {GP_OK};
+ 
+     char *model;
+     char *manufacturer;
+@@ -345,6 +346,42 @@ void show_widget(gphoto_widget *widget, const char *prefix)
+     }
+ }
+ 
++static bool is_fuji(gphoto_driver *gphoto)
++{
++    return gphoto && gphoto->manufacturer && strcasestr(gphoto->manufacturer, "Fuji");
++}
++
++// Fuji: put the camera back to idle after an aborted capture sequence.
++// A failed shoot/bulb start (e.g. InitiateCapture -> 0x2002 with the dial on B, or bulb
++// start while the live-view open capture is still active) leaves the body mid-sequence and
++// every later op returns PTP Device Busy (0x2019) until a replug. USB port reset does NOT
++// clear it; this release does (tested X-T20 fw 2.11, 2026-11-24):
++//   d208 (Fuji capture control) = 0x0004 (release/cancel), then InitiateCapture (0x100e).
++// Both steps are best-effort; the InitiateCapture returns an error when the body was idle.
++static void fuji_release_capture(gphoto_driver *gphoto)
++{
++    CameraWidget *w = nullptr;
++    if (!gphoto || !gphoto->config)
++        return;
++    DEBUGDEVICE(device, INDI::Logger::DBG_WARNING, "Fuji: releasing aborted capture sequence (d208=0x0004 + InitiateCapture).");
++    CameraWidgetType wt;
++    if (gp_widget_get_child_by_name(gphoto->config, "d208", &w) == GP_OK && w &&
++            gp_widget_get_type(w, &wt) == GP_OK && (wt == GP_WIDGET_MENU || wt == GP_WIDGET_RADIO || wt == GP_WIDGET_TEXT))
++    {
++        gp_widget_set_value(w, "4");
++        int rc = gp_camera_set_single_config(gphoto->camera, "d208", w, gphoto->context);
++        DEBUGFDEVICE(device, INDI::Logger::DBG_DEBUG, "Fuji release: d208=4 -> %s", gp_result_as_string(rc));
++    }
++    w = nullptr;
++    if (gp_widget_get_child_by_name(gphoto->config, "opcode", &w) == GP_OK && w)
++    {
++        gp_widget_set_value(w, "0x100e,0x0,0x0");
++        int rc = gp_camera_set_single_config(gphoto->camera, "opcode", w, gphoto->context);
++        DEBUGFDEVICE(device, INDI::Logger::DBG_DEBUG, "Fuji release: InitiateCapture -> %s (error is normal if idle)",
++                     gp_result_as_string(rc));
++    }
++}
++
+ int gphoto_set_config(Camera *camera, CameraWidget *config, GPContext *context)
+ {
+     int ret;
+@@ -676,7 +713,14 @@ static void *stop_bulb(void *arg)
+         {
+             pthread_mutex_unlock(&gphoto->mutex);
+             //gp_camera_capture(gphoto->camera, GP_CAPTURE_IMAGE, &gphoto->camerapath, gphoto->context);
+-            gp_camera_capture(gphoto->camera, GP_CAPTURE_IMAGE, &gphoto->camerapath, gphoto->context);
++            gphoto->capture_rc = gp_camera_capture(gphoto->camera, GP_CAPTURE_IMAGE, &gphoto->camerapath, gphoto->context);
++            if (gphoto->capture_rc != GP_OK)
++            {
++                DEBUGFDEVICE(device, INDI::Logger::DBG_ERROR, "gp_camera_capture failed: %s",
++                             gp_result_as_string(gphoto->capture_rc));
++                if (is_fuji(gphoto))
++                    fuji_release_capture(gphoto);
++            }
+             pthread_mutex_lock(&gphoto->mutex);
+             gphoto->command |= DSLR_CMD_DONE;
+             pthread_cond_signal(&gphoto->signal);
+@@ -1100,6 +1144,7 @@ int gphoto_mirrorlock(gphoto_driver *gphoto, int msec)
+ int gphoto_start_exposure(gphoto_driver *gphoto, uint32_t exptime_usec, int mirror_lock)
+ {
+     gphoto->is_aborted = false;
++    gphoto->capture_rc = GP_OK;
+     if (gphoto->exposure_widget == nullptr)
+     {
+         DEBUGDEVICE(device, INDI::Logger::DBG_DEBUG, "No exposure widget found. Can not expose!");
+@@ -1249,7 +1294,14 @@ int gphoto_start_exposure(gphoto_driver *gphoto, uint32_t exptime_usec, int mirr
+             // Otherwise use the regular bulb widget
+             else
+             {
+-                gphoto_set_widget_num(gphoto, gphoto->bulb_widget, TRUE);
++                int brc = gphoto_set_widget_num(gphoto, gphoto->bulb_widget, TRUE);
++                if (brc != GP_OK)
++                {
++                    DEBUGFDEVICE(device, INDI::Logger::DBG_ERROR, "Bulb start failed: %s", gp_result_as_string(brc));
++                    if (is_fuji(gphoto))
++                        fuji_release_capture(gphoto);
++                    return -1;
++                }
+             }
+         }
+         // else we fail
+@@ -1383,6 +1435,11 @@ int gphoto_read_exposure_fd(gphoto_driver *gphoto, int fd)
+             return GP_OK;
+         }
+ 
++        if (gphoto->capture_rc != GP_OK)
++        {
++            gphoto->command = 0;
++            return gphoto->capture_rc;
++        }
+         result = download_image(gphoto, &gphoto->camerapath, fd);
+         gphoto->command = 0;
+         //Set exposure back to original value
+@@ -1464,6 +1521,8 @@ int gphoto_read_exposure_fd(gphoto_driver *gphoto, int fd)
+ 
+                 // Give up as we timed out.
+                 DEBUGFDEVICE(device, INDI::Logger::DBG_DEBUG, "Event timed out after %d ms (elapsed: %d ms).", waitMS, elapsed);
++                if (is_fuji(gphoto))
++                    fuji_release_capture(gphoto);
+                 return -1;
+             }
+             break;
+@@ -2221,10 +2280,18 @@ int gphoto_capture_preview(gphoto_driver *gphoto, CameraFile *previewFile, char
+ 
+ int gphoto_start_preview(gphoto_driver *gphoto)
+ {
+-    // Olympus, Sony, and Fuji cameras support streaming but without viewfinder_widget
++    if (is_fuji(gphoto))
++    {
++        // Close any lingering still-capture session so capture_preview (0x101c) starts
++        // in a fresh PTP session at seqno 1 instead of returning 0x2019 Device Busy.
++        int rc = gp_camera_exit(gphoto->camera, gphoto->context);
++        DEBUGFDEVICE(device, INDI::Logger::DBG_DEBUG, "Fuji start preview: gp_camera_exit -> %s", gp_result_as_string(rc));
++        return GP_OK;
++    }
++
++    // Olympus and Sony cameras support streaming without viewfinder_widget
+     if (strcasestr(gphoto->manufacturer, "OLYMPUS") ||
+-            strcasestr(gphoto->manufacturer, "Sony Corporation") ||
+-            strcasestr(gphoto->manufacturer, "Fuji"))
++            strcasestr(gphoto->manufacturer, "Sony Corporation"))
+         return GP_OK;
+ 
+     // If viewfinder not found, nothing to do
+@@ -2239,8 +2306,24 @@ int gphoto_start_preview(gphoto_driver *gphoto)
+ 
+ int gphoto_stop_preview(gphoto_driver *gphoto)
+ {
+-    // Olympus & Sony cameras support streaming but without viewfinder_widget
+-    if (strcasestr(gphoto->manufacturer, "OLYMPUS") || strcasestr(gphoto->manufacturer, "Sony Corporation"))
++    // Olympus, Sony, and Fuji cameras support streaming but without viewfinder_widget
++    // (gphoto_start_preview already special-cased Fuji; stop must match or STREAM_OFF
++    // returns failure and a later join() on the already-joined live thread can abort
++    // the driver with std::system_error: Invalid argument.)
++    if (is_fuji(gphoto))
++    {
++        // v3: libgphoto2's Fuji capture_preview opens an open-capture (0x101c, inliveview=1) and
++        // only camera_unprepare_capture/exit terminates it. Leaving it open makes the next
++        // bulb start fail (GP -1) and the bulb event wait then picks up the 640x480 live-view
++        // object 0x80000001 as the "still". Close the PTP session cleanly here:
++        // TerminateOpenCapture + PriorityMode + CloseSession. The next gp_camera_* call
++        // re-inits (CHECK_INIT) and opens a fresh session at transaction id 1.
++        int rc = gp_camera_exit(gphoto->camera, gphoto->context);
++        DEBUGFDEVICE(device, INDI::Logger::DBG_DEBUG, "Fuji stop preview: gp_camera_exit -> %s", gp_result_as_string(rc));
++        return GP_OK;
++    }
++    if (strcasestr(gphoto->manufacturer, "OLYMPUS") ||
++            strcasestr(gphoto->manufacturer, "Sony Corporation"))
+         return GP_OK;
+ 
+     // If viewfinder not found, nothing to do

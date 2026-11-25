@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""One explicit Linux USB reset of the single tethered X-T20. No power switching.
+Exit all camera clients first. Does not kill them or retry automatically.
+"""
+import fcntl, os, pathlib, sys, time
+matches=[]
+for p in pathlib.Path('/sys/bus/usb/devices').iterdir():
+    try:
+        if (p/'idVendor').read_text().strip()=='04cb' and (p/'idProduct').read_text().strip()=='02d4':
+            matches.append(p)
+    except (FileNotFoundError, NotADirectoryError): pass
+if len(matches)!=1:
+    sys.exit(f'Refusing reset: found {len(matches)} matching cameras, require exactly one.')
+p=matches[0]
+bus=int((p/'busnum').read_text()); dev=int((p/'devnum').read_text())
+node=f'/dev/bus/usb/{bus:03d}/{dev:03d}'
+# Refuse visible holders, including INDI/gphoto clients. Do not inspect their data.
+holders=[]
+for proc in pathlib.Path('/proc').iterdir():
+    if not proc.name.isdigit(): continue
+    try:
+        for fd in (proc/'fd').iterdir():
+            try:
+                if os.readlink(fd)==node: holders.append(proc.name); break
+            except (FileNotFoundError, PermissionError): pass
+    except (FileNotFoundError, PermissionError): pass
+if holders: sys.exit('Refusing reset: camera held by PID(s) '+', '.join(holders))
+print(f'Resetting only X-T20 {node}, sysfs {p.name}; no automatic retry.',flush=True)
+try:
+    fd=os.open(node,os.O_RDWR)
+    try: fcntl.ioctl(fd, (ord('U') << 8) | 20, 0) # USBDEVFS_RESET, _IO('U',20)
+    finally: os.close(fd)
+except OSError as e:
+    sys.exit(f'USB reset failed: {e}. No fallback attempted. Physical replug may be needed.')
+print('USB reset ioctl completed. Wait 3 seconds before opening a fresh PTP session.')
+time.sleep(3)

@@ -1,0 +1,13 @@
+#!/bin/sh
+# xt20-release: put an X-T20 that answers "PTP Device Busy" (0x2019) back to idle
+# without a replug. Sends Fuji capture-control d208=0x0004 (release/cancel), then
+# InitiateCapture (0x100e). Tested 2026-11-24: cleared busy after an aborted shoot.
+# The 2nd step errors (-1) when the camera was already idle; that is harmless.
+# One shot only. Do not loop this. Stop any indiserver first (it holds the device).
+if pgrep -x indiserver >/dev/null; then echo "indiserver is running; stop it first" >&2; exit 2; fi
+timeout 15 gphoto2 --set-config d208=4; r1=$?
+sleep 1
+timeout 15 gphoto2 --set-config opcode=0x100e,0x0,0x0; r2=$?
+echo "d208=4 rc=$r1  initiatecapture rc=$r2 (nonzero is normal if it was idle)"
+sleep 2
+timeout 15 gphoto2 --get-config d208 | grep Current
