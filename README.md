@@ -10,9 +10,11 @@ rule, focus preset helper, busy-recovery helpers, and hardware test notes for
 tethering a Fujifilm X-T20 (fw 2.11) over ordinary USB PTP (`04cb:02d4`) with
 `gphoto2` and INDI/Ekos (`indi_gphoto_ccd`).
 
-No `x70view` source, decompilation, `xpp` build tools, or firmware/card binaries
-are included here. Build the SD-boot card from the **FujiMod / x70view**
-project (`usb-tether-xpp` mod).
+No `x70view` source, decompilation, `xpp` build tools, official FujiMod card
+binaries, or Cap12 builds are included here. Official Cap12 has to be
+downloaded from the FujiMod / FujiHack Discord; this repo only ships a splice
+script that adds the USB tether hook (and, optionally, the red-night overlay)
+to that official `FMPATCH.BIN`.
 
 ## How the firmware patch works (offset/opcode summary)
 
@@ -31,12 +33,157 @@ that turns PC priority off and sets the RAW-conversion gate.
   behaves like USB TETHER AUTO. Disconnect handling is unchanged and restores
   camera priority; the stored menu setting stays at mode 3.
 
-To build the SD-boot patch card (`FMPATCH.BIN`), use **FujiMod / x70view**'s
-`usb-tether-xpp` mod and SD boot v2 loader.
+To build an SD-boot card, either use **FujiMod / x70view**'s `usb-tether-xpp`
+mod, or start from official **Cap12** and run the splice in
+[Building a Cap12 SD card](#building-a-cap12-sd-card-optional) below.
+The optional red-night overlay is documented in
+[Red night screen add-on](#red-night-screen-add-on-optional).
 
 If you want to unlock the same ability on another Fuji body or firmware,
 see [PORTING.md](PORTING.md) for a step-by-step write-up of how this X-T20
 2.11 port was found, tested, and what broke on the host side.
+
+
+## Building a Cap12 SD card (optional)
+
+Official **Cap12** (iXralum, `MariMul-xt20-cap12` at `8d14a2ce19`) is the
+current FujiMod development card for the X-T20 on firmware **2.11**. It adds
+the Focal UI, a new bootloader, Q-menu save, C1–C7 marks, and other mods.
+This repository does **not** redistribute official Cap12 binaries: FujiMod
+does not circulate ready-made builds outside its own channels, and Cap12
+contains derived firmware data.
+
+Get the official zip yourself from the [FujiMod / FujiHack
+Discord](https://discord.gg/UZXDktvAZP), then add the USB tether hook with
+`tools/splice_cap12.py`. That is the same single-instruction RAM patch
+described above (`0x014a5600`, `bne` → `b`). Nothing is written to camera
+flash.
+
+The Cap12 + tether combination has been tested on the **emulator only**.
+Real-camera testing is still pending. The earlier hardware results in
+[Tested on camera](#tested-on-camera-2026-11-24-and-known-limits) used a
+different (cap11-era) FujiMod card.
+
+**Firmware 2.11 only.** Check the version screen (hold DISP/BACK while
+switching the camera on). Do not use this card on any other firmware, and
+never start a firmware update, service / JIG mode, or PC firmware update
+with this card in the camera.
+
+### 1. Verify the official zip
+
+From `fujimod-cap12-xt20-2.11.zip` (SHA-256
+`ce50b683a11664fbbebbebefd35a1c6876dcfb207bd3abdac486dce75ab7e04d`), check:
+
+| File | SHA-256 |
+| --- | --- |
+| `card/FMPATCH.BIN` | `d2e237d048be038bd13ec9735488f34e6c3b9c438180c6c6dd899894966dcbba` |
+| `card/ffboot.bin` | `8b177b2247fd13bbbe3d0b4165c8d7e56b4538b1fbcb3918778fa017fc9e6f46` |
+| `card/ffsys.bin` | `d72448807cd394f157e31f38f1fb8eac4f628b7ddb674fa1fc1c447c68103d8e` |
+
+### 2. Splice the USB tether hook
+
+```sh
+python3 tools/splice_cap12.py --tether path/to/official/FMPATCH.BIN \
+    -o FMPATCH.BIN
+# expected sha256:
+# 99a1c0106d91217c0a8464970e88884d5b257a37d63a7011db01358d2f9a7540
+```
+
+The script refuses to run if the input hash is not official Cap12. It only
+adds the group-1 run at `0x014a5600`. Official `ffboot.bin`, `ffsys.bin`,
+`manifest.json`, recipes, and the rest of the Cap12 card stay as you
+downloaded them.
+
+### 3. Copy the card and boot the mods
+
+Copy the official Cap12 `card/` contents to the **root** of an
+in-camera-formatted SD card, replacing only `FMPATCH.BIN` with the spliced
+file. Keep any existing `FUJIMOD/SETTINGS.JSN` already on the card; this
+package does not ship one.
+
+Boot the mods the Cap12 way: camera off, card inserted, **hold the rear
+command dial pressed in and the Delete (trash) button**, switch the camera
+on, and release both after about three seconds. Switching on **normally**
+(no key combination), or starting **without the card**, runs stock firmware
+— that is also the recovery path if a boot does not come up. If the camera
+freezes, remove the battery, wait a few seconds, and put it back.
+
+Set **PC CONNECTION MODE** to **USB RAW CONV./BACKUP RESTORE** as in
+[Setup](#setup) below, then use `gphoto2` or INDI the same way as on the
+earlier card.
+
+### Known Cap12 limits
+
+- One user in the FujiMod Discord has reported official Cap12 itself failing
+  to boot. This splice uses that same official `ffboot.bin` bootloader; the
+  emulator does not execute that 73 KiB loader path.
+- Focal UI is still unfinished in official Cap12 (some stock-menu flashes,
+  leftover placeholder Q tiles). It can be turned off under USER SETTINGS →
+  MOD SETTING → FEATURE DISPLAY.
+- The MOVIE-recording issue reported on Cap11 was not retested here.
+- Use a **stock film** (PROVIA, etc.) in the current settings, C1–C7, and
+  film bracketing before removing the card, so a later stock boot is not
+  left on an added film the body does not know.
+
+## Red night screen add-on (optional)
+
+An optional **RED NIGHT SCREEN** overlay for astro and other dark-site work:
+it tints the shooting HUD, menus, and live view red, and leaves captured
+photos in normal colour. On the camera it is
+**SET UP > SCREEN SET-UP > RED NIGHT SCREEN** with three choices:
+
+- **OFF** — no tint
+- **RED** — full red overlay
+- **RED DIM** — dimmer red overlay
+
+The choice is stored in `FUJIMOD/SETTINGS.JSN` under the `red_night` section
+if that file already exists on the card. This repository does not ship a
+`SETTINGS.JSN`, so your other mod settings are left alone. After a mod boot,
+a saved RED / RED DIM choice is applied on the first shooting screen (no
+need to open the menu first).
+
+This is a standalone relocation of the overlay into the free RAM at the end
+of official Cap12 (`0x2C52A00`), so it does not overwrite Cap12's Focal UI
+or cached-arena data. The OSD hook at `0xcc223c` (already used by Cap12)
+is chained: our thunk recolors, then Cap12's handler and stock firmware
+still run.
+
+### Status and limits
+
+- **Tested on the emulator only. Real-camera testing of this Cap12 port is
+  pending.** (An earlier revision of the same overlay was used on a real
+  X-T20 with a cap11-era card; that does not prove this Cap12 relocation.)
+- Firmware **2.11 only**, same recovery as Cap12: start normally (no rear
+  dial + Delete), or start without the card, for stock firmware.
+- On the emulator the tint looks **blue**. That is the emulator's pixel
+  order, not what the camera shows; on the body the overlay is red.
+- Q / Fn assignment of RED NIGHT SCREEN may be incomplete (the SCREEN
+  SET-UP item is present; the 12-byte menu-settings declaration table was
+  not extended).
+- If a Focal-only surface ever skipped the hooked output path, turn
+  **FEATURE DISPLAY** off. In emulator tests, the stock shooting HUD and
+  the I.Q. menu both tinted with FEATURE DISPLAY left at its default.
+
+### Splice it in
+
+You still need official Cap12, as above. This combines the tether hook and
+the overlay in one `FMPATCH.BIN`:
+
+```sh
+python3 tools/splice_cap12.py --tether --red-night path/to/official/FMPATCH.BIN \
+    -o FMPATCH.BIN
+# expected sha256:
+# f9a556045de32028af37e5dd130c15451818523d0ac07e0513ec2e2c02a6de59
+```
+
+Sources and a pre-linked `addon.bin` are in [`tools/red-night/`](tools/red-night/).
+You do not need an ARM toolchain unless you want to rebuild the payload.
+
+Install the spliced `FMPATCH.BIN` the same way as the Cap12-only splice,
+keeping official `ffboot.bin` / `ffsys.bin` and any existing
+`SETTINGS.JSN`. Then, on the camera (once hardware testing is done): set
+RED NIGHT SCREEN to RED or RED DIM from SET UP > SCREEN SET-UP, and confirm
+photos are still normal colour.
 
 ## Safety (read before plugging in)
 
@@ -69,10 +216,13 @@ mode. Keep these rules in mind:
 
 1. On the camera: **SET UP > CONNECTION SETTING > PC CONNECTION MODE = USB RAW
    CONV./BACKUP RESTORE**.
-2. Build and prepare an SD-boot v2 card with the `usb-tether-xpp` mod using
-   **FujiMod / x70view**.
+2. Prepare the SD-boot card: either build `usb-tether-xpp` with **FujiMod /
+   x70view**, or splice official Cap12 as in
+   [Building a Cap12 SD card](#building-a-cap12-sd-card-optional) (and
+   optionally [Red night screen add-on](#red-night-screen-add-on-optional)).
 3. Boot the mod card: pull the battery, reinsert it, then hold the **rear
-   command dial + Delete** while switching the camera on.
+   command dial + Delete** while switching the camera on. (On Cap12, switching
+   on without that combination starts stock firmware and is the recovery path.)
 4. Set the front focus selector to **M** if you want host-driven manual focus
    (`manualfocusdrive`). Exposure follows the camera dials as usual.
 5. Plug in the USB cable on a direct port. Camera menus lock while a host holds
@@ -226,5 +376,7 @@ Built on earlier Fuji PTP research shared in the FujiMod community:
   while a menu is open, firmware-upload opcode warnings).
 - **tiredboffin** — Fuji PTP notes (`gvfs-gphoto2` session lock, reopening the
   session after a lost reply, settings persistence after tethered changes).
+- **iXralum** — official FujiMod Cap12 for the X-T20 (Focal UI, new
+  bootloader, and the Cap12 card this repo's splice starts from).
 - **FujiMod / `x70view` contributors** — X-T20 2.11 SD boot v2 loader and mod
   toolchain.
